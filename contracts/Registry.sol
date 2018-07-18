@@ -1,6 +1,6 @@
 pragma solidity 0.4.24;
 
-contract ITCR {
+contract IRegistry {
 
     mapping(address => bool) public isOperator;
 

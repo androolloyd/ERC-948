@@ -9,8 +9,17 @@ import "./base/ERC20.sol";
 /// @title ERC-948 Enhanced Multi-signature wallet - Allows multiple parties to agree on transactions abd before execution.
 /// @author Stefan George - <stefan.george@consensys.net>
 /// @author Andrew Redden - <andrew@blockcrushr.com> ERC-948
-contract MultiSigWallet {
+contract MultiSigWallet is ISubscription {
 
+
+    enum SupportedTypes {
+        ETH_ESCROW,
+        TOKEN_ESCROW,
+        TOKEN_APPROVE
+    }
+
+
+    SupportedTypes supportedTypes;
     /*
      *  Events
      */
@@ -25,9 +34,9 @@ contract MultiSigWallet {
     event OwnerAddition(address indexed owner);
     event OwnerRemoval(address indexed owner);
     event RequirementChange(uint required);
-    event AddSubscription(uint id, address indexed txDestination, uint unitAmount, uint period, uint type);
+    event AddSubscription(uint subscriptionId, address indexed txDestination, address indexed recipient, uint value, uint period, uint type);
     event RevokeSubscription(uint subscriptionId, address indexed destination);
-    event TCRChanged(address indexed oldTCR, address indexed newTCR);
+    event RegistryChanged(address indexed oldRegistry, address indexed newRegistry);
 
     /*
      *  views
@@ -42,7 +51,7 @@ contract MultiSigWallet {
     mapping(uint => mapping(address => bool)) public confirmations;
     mapping(address => bool) public isOwner;
     address[] public owners;
-    address public tcr;
+    IRegistry public registry;
 
     uint public required;
     uint public transactionCount;
@@ -64,8 +73,8 @@ contract MultiSigWallet {
         uint expires;
         uint cycle;
         uint period;
-        uint lastWithdrawCompleted;
-        uint withdraw;
+        uint withdrawPrev;
+        uint withdrawNext;
         uint externalId;
         bytes data;
         bytes[] meta;
@@ -147,7 +156,7 @@ contract MultiSigWallet {
     /// @dev Contract constructor sets initial owners and required number of confirmations.
     /// @param _owners List of initial owners.
     /// @param _required Number of required confirmations.
-    constructor (address[] _owners, uint _required, address _tcr)
+    constructor (address[] _owners, uint _required, address _registry)
     payable
     public
     validRequirement(_owners.length, _required)
@@ -158,7 +167,8 @@ contract MultiSigWallet {
         }
         owners = _owners;
         required = _required;
-        tcr = _tcr;
+        registry = IRegistry(_registry);
+
         if (msg.value > 0) {
             emit Deposit(msg.sender, msg.value);
         }
@@ -228,11 +238,12 @@ contract MultiSigWallet {
         emit RequirementChange(_required);
     }
 
-    function changeTCRAddress(address _newTCR)
+    function changeRegistryAddress(address _newRegistry)
     public
+    onlyWallet
     ownerExists(msg.sender) {
-        tcr = _newTCR;
-        emit TCRChanged(_newTCR);
+        registry = _newRegistry;
+        emit RegistryChanged(_newRegistry);
     }
 
 
@@ -242,11 +253,11 @@ contract MultiSigWallet {
     /// @param value Transaction ether value.
     /// @param data Transaction data payload.
     /// @return Returns transaction ID.
-    function submitTransaction(address tx_destination, uint _value, bytes _data)
+    function submitTransaction(address _tx_destination, uint _value, bytes _data)
     public
     returns (uint transactionId)
     {
-        transactionId = addTransaction(tx_destination, _value, _data);
+        transactionId = addTransaction(_tx_destination, _value, _data);
         confirmTransaction(transactionId);
     }
 
@@ -272,14 +283,9 @@ contract MultiSigWallet {
     public
     returns (uint subscriptionId)
     {
-        subscriptionId = addSubscription(_txDestination, _recipient, _type, _value, _period, _data, _meta);
+        (subscriptionId, externalId) = addSubscription(_txDestination, _recipient, _type, _value, _period, _data, _meta);
 
-
-        if (address(tcr) != address(0)) {
-            ITCR dest = ITCR(tcr);
-            dest.handleNewSubscription(_txDestination, address(this), subscriptionId, _externalId);
-        }
-
+        registry.handleNewSubscription(_txDestination, address(this), subscriptionId, _externalId);
 
         if (msg.value >= _value || (this.balance >= _value) || _data != null) {// check to see if payment is valid
             executeSubscription(subscriptionId);
@@ -337,19 +343,13 @@ contract MultiSigWallet {
 
 
     modifier validOperator(address _operator) {
-        if (address(tcr) != address(0)) {
-            ITCR itcr = ITCR(tcr);
-            require(repo.isOperator[_operator]);
-        } else {
-            require(isOwner[owner]);
-        }
+        require(registry.isOperator[_operator] || isOwner[_operator]);
         _;
     }
 
     modifier validWithdrawal(uint subscriptionId) {
         require(subscriptions[subscriptionId].expires > now);
-        require(subscriptions[subscriptionId].nextWithdraw <= now);
-        require(address(this).balance >= subscriptions[subscriptionId].value);
+        require(subscriptions[subscriptionId].withdrawNext <= now);
         _;
     }
 
@@ -368,6 +368,9 @@ contract MultiSigWallet {
         bool success = false;
 
         if (sub.type == uint(0)) {
+            //check to see if the contract has the correct balance for the subscription
+            require(address(this).balance >= subscriptions[subscriptionId].value);
+
             if (external_call(sub.destination, sub.value, sub.data.length, sub.data)) {
                 success = true;
             }
@@ -380,11 +383,12 @@ contract MultiSigWallet {
         }
 
         if (success) {
+
             Subscription storage sub = subscriptions[subscriptionId];
 
-            sub.lastWithdrawalCompleted = now;
+            sub.withdrawPrev = now;
 
-            sub.nextWithdraw = sub.created + (sub.period * sub.cycle);
+            sub.withdrawNext = sub.created + (sub.period * sub.cycle);
 
             emit ExecutionSubscription(subscriptionId);
 
@@ -475,16 +479,16 @@ contract MultiSigWallet {
     /// @param value Transaction ether value.
     /// @param data Transaction data payload.
     /// @return Returns transaction ID.
-    function addTransaction(address destination, uint value, bytes data)
+    function addTransaction(address _destination, uint _value, bytes _data)
     internal
-    notNull(destination)
+    notNull(_destination)
     returns (uint transactionId)
     {
         transactionId = transactionCount;
         transactions[transactionId] = Transaction({
-            destination : destination,
-            value : value,
-            data : data,
+            destination : _destination,
+            value : _value,
+            data : _data,
             executed : false
             });
         transactionCount += 1;
@@ -515,25 +519,51 @@ contract MultiSigWallet {
     internal
     notNull(destination)
     validType(_type)
-    returns (uint subscriptionId)
+    returns (uint subscriptionId, bytes externalId)
     {
         //hash the destination and the data to make sure we don't have a copy of the subscription
 
-        //check meta array for expires, externalId
-
         //check type value, then check meta data to match the schema, wallet
 
-        address wallet = address(this);
+
+        require(_meta[0]);
+        require(_meta[1]);
+        require(_meta[2]);
+
+        uint type = bytesToUInt(_meta[0]);
+        //check to ensure we support the type;
+        require(supportedTypes[type]);
+
+        uint externalId = bytesToUInt(_meta[1]);
+
+        uint expires = (_meta[2]) ? bytesToUInt(_meta[2]) : 0;
+
+        address wallet;
+        bytes externalId;
+        wallet = address(this);
+
+        if (type == supportedTypes.ETH_ESCROW) {
+            //set any specific variables around ETH_ESCROW
+        } else if (type == supportedTypes.TOKEN_ESCROW) {
+
+        } else if (type == supportedTypes.TOKEN_APPROVE) {
+            require(_meta[3] != bytes(0));
+            wallet = bytesToAddress(_meta[3]);
+        }
+
+
+
+
 
         bytes externalId = "";
 
-        uint expires = (2 * 256) - 1;
 
         subscriptionId = subscriptionCount;
 
         subscriptions[subscriptionId] = Subscription({
             destination : _txDestination,
             recipient : _recipient,
+            type : type,
             wallet : wallet,
             value : value,
             data : data,
@@ -544,7 +574,7 @@ contract MultiSigWallet {
             });
         subscriptionCount += 1;
 
-        emit AddSubscription(subscriptionId);
+        emit AddSubscription(subscriptionId, txDestination, recipient, value, period, type);
     }
 
     /*
@@ -677,21 +707,25 @@ contract MultiSigWallet {
         uint[] memory subscriptionIdsTemp = new uint[](subscriptionCount);
         uint count = 0;
         uint i;
-        for (i = 0; i < subscriptionCount; i++)
+        for (i = 0; i < subscriptionCount; i++) {
             if (withdraw) {
-                if (subscriptions[i].nextWithdraw <= now) {
+                if (subscriptions[i].withdrawNext <= now) {
                     subscriptionIdsTemp[count] = i;
                     count += 1;
                 }
-            } else if (expired) {
+            }
+            if (expired) {
                 if (subscriptions[i].expired >= now) {
                     subscriptionIdsTemp[count] = i;
                     count += 1;
                 }
-            } else {
+            }
+
+            if (!withdraw && !expired) {
                 subscriptionIdsTemp[count] = i;
                 count += 1;
             }
+        }
         _subscriptionIds = new uint[](to - from);
         for (i = from; i < to; i++) {
             _subscriptionIds[i - from] = subscriptionIdsTemp[i];
@@ -709,5 +743,25 @@ contract MultiSigWallet {
     returns (bool success)
     {
         return ERC20(_token).transferFrom(_from, _to, _value);
+    }
+
+
+
+
+    // utilities
+
+
+    function bytesToAddress(bytes _bytes, uint _start) internal pure returns (address oAddress) {
+        require(_bytes.length >= (_start + 20));
+        assembly {
+            oAddress := div(mload(add(add(_bytes, 0x20), _start)), 0x1000000000000000000000000)
+        }
+    }
+
+    function bytesToUint(bytes _bytes, uint _start) internal pure returns (uint oUint) {
+        require(_bytes.length >= (_start + 32));
+        assembly {
+            oUint := mload(add(add(_bytes, 0x20), _start))
+        }
     }
 }
