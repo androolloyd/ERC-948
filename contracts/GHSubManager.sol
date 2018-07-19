@@ -11,15 +11,6 @@ import "./base/ERC20.sol";
 /// @author Andrew Redden - <andrew@blockcrushr.com> ERC-948
 contract MultiSigWallet is ISubscription {
 
-
-    enum SupportedTypes {
-        ETH_ESCROW,
-        TOKEN_ESCROW,
-        TOKEN_APPROVE
-    }
-
-
-    SupportedTypes supportedTypes;
     /*
      *  Events
      */
@@ -285,9 +276,9 @@ contract MultiSigWallet is ISubscription {
     {
         (subscriptionId, externalId) = addSubscription(_txDestination, _recipient, _type, _value, _period, _data, _meta);
 
-        registry.handleNewSubscription(_txDestination, address(this), subscriptionId, _externalId);
+        registry.handleNewSubscription(_txDestination, address(this), subscriptionId, externalId);
 
-        if (msg.value >= _value || (this.balance >= _value) || _data != null) {// check to see if payment is valid
+        if (msg.value >= _value || (this.balance >= _value) || _data != null) {
             executeSubscription(subscriptionId);
         }
 
@@ -367,15 +358,15 @@ contract MultiSigWallet is ISubscription {
 
         bool success = false;
 
-        if (sub.type == uint(0)) {
+        if (sub.type == Enum.SupportedTypes.ETH_ESCROW) {
             //check to see if the contract has the correct balance for the subscription
             require(address(this).balance >= subscriptions[subscriptionId].value);
 
             if (external_call(sub.destination, sub.value, sub.data.length, sub.data)) {
                 success = true;
             }
-        } else if (sub.type == uint(1)) {
-            if (transferFrom(sub.txDestination, sub.wallet, sub.recipient, sub.value)) {
+        } else if (sub.type == Enum.SupportedTypes.TOKEN_ESCROW || sub.type == Enum.SupportedTypes.TOKEN_APPROVE) {
+            if (transferFrom(sub.destination, sub.wallet, sub.recipient, sub.value)) {
                 success = true;
             }
         } else {
@@ -392,18 +383,13 @@ contract MultiSigWallet is ISubscription {
 
             emit ExecutionSubscription(subscriptionId);
 
-            if (address(tcr) != address(0)) {
+            bool first = false;
 
-                ITCR dest = ITCR(tcr);
-
-                bool first = false;
-
-                if (sub.cycle == 0) {
-                    first = true;
-                }
-
-                dest.handlePaymentNotification(tx_destination, subscriptionId, sub.externalId, first);
+            if (sub.cycle == 0) {
+                first = true;
             }
+
+            r.handlePaymentNotification(sub.destination, subscriptionId, sub.externalId, first);
             sub.cycle++;
         } else {
             emit ExecutionSubscriptionFailure(subscriptionId);
@@ -512,7 +498,7 @@ contract MultiSigWallet is ISubscription {
         address _txDestination,
         address _recipient,
         uint _value,
-        uint _type,
+        Enum.SupportedTypes _type,
         uint _period,
         bytes _data,
         bytes[] _meta)
@@ -526,37 +512,27 @@ contract MultiSigWallet is ISubscription {
         //check type value, then check meta data to match the schema, wallet
 
 
+        require(Enum.SupportedTypes[_type]);
         require(_meta[0]);
         require(_meta[1]);
-        require(_meta[2]);
-
-        uint type = bytesToUInt(_meta[0]);
         //check to ensure we support the type;
-        require(supportedTypes[type]);
 
-        uint externalId = bytesToUInt(_meta[1]);
+        uint externalId = bytesToUInt(_meta[0]);
 
-        uint expires = (_meta[2]) ? bytesToUInt(_meta[2]) : 0;
+        uint expires = (_meta[1]) ? bytesToUInt(_meta[1]) : 0;
 
         address wallet;
         bytes externalId;
         wallet = address(this);
 
-        if (type == supportedTypes.ETH_ESCROW) {
+        if (type == Enum.SupportedTypes.ETH_ESCROW) {
             //set any specific variables around ETH_ESCROW
-        } else if (type == supportedTypes.TOKEN_ESCROW) {
+        } else if (type == Enum.SupportedTypes.TOKEN_ESCROW) {
 
-        } else if (type == supportedTypes.TOKEN_APPROVE) {
+        } else if (type == Enum.SupportedTypes.TOKEN_APPROVE) {
             require(_meta[3] != bytes(0));
-            wallet = bytesToAddress(_meta[3]);
+            wallet = bytesToAddress(_meta[2]);
         }
-
-
-
-
-
-        bytes externalId = "";
-
 
         subscriptionId = subscriptionCount;
 
@@ -619,16 +595,19 @@ contract MultiSigWallet is ISubscription {
     {
         for (uint i = 0; i < subscriptionCount; i++) {
             if (withdraw) {
-                if (subscriptions[i].withdraw <= now) {
+                if (subscriptions[i].withdrawNext <= now) {
                     subscriptionIdsTemp[count] = i;
                     count += 1;
                 }
-            } else if (expired) {
+            }
+            if (expired) {
                 if (subscriptions[i].expired >= now) {
                     subscriptionIdsTemp[count] = i;
                     count += 1;
                 }
-            } else {
+            }
+
+            if (!withdraw && !expired) {
                 subscriptionIdsTemp[count] = i;
                 count += 1;
             }
@@ -763,5 +742,13 @@ contract MultiSigWallet is ISubscription {
         assembly {
             oUint := mload(add(add(_bytes, 0x20), _start))
         }
+    }
+}
+
+contract Enum {
+    enum SupportedTypes {
+        ETH_ESCROW,
+        TOKEN_ESCROW,
+        TOKEN_APPROVE
     }
 }
